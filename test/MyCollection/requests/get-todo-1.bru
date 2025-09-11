@@ -1,0 +1,28 @@
+meta {
+  name: Get Todo 1
+  type: http
+  seq: 1
+  tags: [ smoke ]
+}
+
+get {
+  url: https://jsonplaceholder.typicode.com/todos/1
+}
+
+tests {
+  test("Status is 200", () => {
+    expect(res.getStatus()).to.equal(200);
+  });
+
+  test("Todo ID is 1", () => {
+    expect(res.getBody().id).to.equal(1);
+  });
+
+  test("User ID is 1", () => {
+    expect(res.getBody().userId).to.equal(1);
+  });
+
+  test("Completed is false", () => {
+    expect(res.getBody().completed).to.equal(false);
+  });
+}
