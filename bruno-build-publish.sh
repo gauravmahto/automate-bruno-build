@@ -3,6 +3,13 @@
 # bruno-build-publish.sh — Build Bruno from source, publish internal libs first,
 # then publish @usebruno/js and @usebruno/cli to your Verdaccio/JFrog registry,
 # and (optionally) install it for a smoke test.
+#
+# Now also:
+#  - Archives sources only (no node_modules/dist/.git) as: bruno-sources-${VERSION_SUFFIX}.tar.gz
+#  - Streams logs to: bruno-build-publish.${VERSION_SUFFIX}.log
+#  - Uploads both artifacts to Artifactory:
+#       - sources  → cagbu-dev-opensource-release-node
+#       - logs     → cagbu-dev-opensource-release-logs
 # ----------------------------------------------------------------------------
 set -euo pipefail
 
@@ -14,8 +21,8 @@ set -euo pipefail
 : "${DO_GLOBAL_INSTALL_TEST:=true}"
 : "${DO_TEMP_INSTALL_TEST:=true}"
 : "${DO_BUILD_APP:=false}"
-: "${VERSION_SUFFIX:=local.$(date +%Y%m%d%H%M%S)}"
-: "${NPM_TAG:=dev}"
+: "${VERSION_SUFFIX:=release.$(date +%Y%m%d%H%M%S)}"
+: "${NPM_TAG:=opensourcebuild}"
 : "${DRY_RUN:=0}"                             # 1 = print actions; skip mutating ops
 
 # Verdaccio inputs
@@ -24,14 +31,18 @@ set -euo pipefail
 
 # JFrog inputs (YOUR EXACT REPOS — overrideable)
 # If you prefer to pass ART_URL/ART_VIRTUAL_REPO/ART_LOCAL_REPO, leave these blank.
-: "${ART_INSTALL_REG:=https://artifacthub-phx.oci.oraclecorp.com/artifactory/api/npm/npmjs-remote/}"
-: "${ART_PUBLISH_REG:=https://artifacthub-phx.oci.oraclecorp.com/artifactory/api/npm/cagbu-dev-opensource-release-node/}"
+: "${ART_INSTALL_REG:=https://artifacthub-phx.oci.oraclecorp.com/artifactory/api/npm/cagbu-dev-internal-release-node-npm-virtual/}"
+: "${ART_PUBLISH_REG:=https://artifacthub-phx.oci.oraclecorp.com/artifactory/api/npm/cagbu-dev-internal-release-node/}"
 : "${ART_TOKEN:=}"    # API Key or Bearer token
 
 # If ART_INSTALL_REG/ART_PUBLISH_REG are blank, you may instead use:
 : "${ART_URL:=}"                 # e.g. https://artifacthub-phx.oci.oraclecorp.com
 : "${ART_VIRTUAL_REPO:=}"        # e.g. cagbu-dev-opensource-release-node-npm-virtual
 : "${ART_LOCAL_REPO:=}"          # e.g. cagbu-dev-opensource-release-node
+
+# New: where to upload extra artifacts (archives/logs). Override if needed.
+: "${ART_ARCHIVE_REPO:=cagbu-dev-internal-release-node}"
+: "${ART_LOGS_REPO:=cagbu-dev-opensource-release-logs}"
 
 # Internals
 PUBLIC_REG="https://registry.npmjs.org"
@@ -40,6 +51,11 @@ WORKSPACES_OFF=(--workspaces=false)
 # npmrc paths (set after repo init)
 NPMRC_INSTALL=""
 NPMRC_PUBLISH=""
+
+# Logging (to file + stdout)
+LOG_FILE="${PWD}/bruno-build-publish.${VERSION_SUFFIX}.log"
+# tee the entire script output into the log (stderr included)
+exec > >(tee -a "$LOG_FILE") 2>&1
 
 # ---------- Helpers ----------------------------------------------------------
 log()  { printf "\033[1;34m[INFO]\033[0m %s\n" "$*"; }
@@ -65,11 +81,27 @@ maybe_use_nvm() {
 }
 
 npm_ping() {
-  local url="$1"
-  log "Registry ping: $url"
-  if ! curl -fsS "$url/-/ping" >/dev/null 2>&1; then
-    warn "Failed to ping registry: $url"
+  local registry="$1" token="${2:-}"
+  log "Registry ping (npm): $registry"
+  # Use the install npmrc so auth & scope are correct
+  if NPM_CONFIG_USERCONFIG="$NPMRC_INSTALL" npm "${WORKSPACES_OFF[@]}" ping --registry "$registry" >/dev/null 2>&1; then
+    log "npm ping OK: $registry"
+    return 0
   fi
+  log "npm ping failed; trying HTTP GET to /-/ping"
+  local url="$(trim_trailing_slash "$registry")/-/ping"
+  local curl_args=(-fsS -X GET)
+  # Add both Artifactory auth header variants if token provided
+  if [ -n "$token" ]; then
+    curl_args+=(-H "X-JFrog-Art-Api: ${token}")
+    curl_args+=(-H "Authorization: Bearer ${token}")
+  fi
+  if curl "${curl_args[@]}" "$url" >/dev/null 2>&1; then
+    log "HTTP ping OK: $url"
+    return 0
+  fi
+  warn "Failed to ping registry: $registry"
+  return 1
 }
 
 npm_cfg_get() { npm "${WORKSPACES_OFF[@]}" config get "$@" 2>&1; }
@@ -146,7 +178,17 @@ EOF
 }
 
 ensure_repo() {
-  if [ -f "$WORKDIR/package.json" ] && [ -d "$WORKDIR" ]; then
+  # Make sure the parent directory exists so git can clone into WORKDIR
+  local parent; parent="$(dirname "$WORKDIR")"
+  if [ ! -d "$parent" ]; then
+    log "Creating parent directory: $parent"
+    run mkdir -p "$parent"
+    # If DRY_RUN, mkdir above was skipped; ensure it exists for the rest of the dry flow
+    if [ "${DRY_RUN}" = "1" ] && [ ! -d "$parent" ]; then mkdir -p "$parent"; fi
+  fi
+
+  # Case 1: already have a usable tree with package.json
+  if [ -d "$WORKDIR" ] && [ -f "$WORKDIR/package.json" ]; then
     log "Using existing Bruno source at $WORKDIR"
     cd "$WORKDIR"
     if [ -n "$BRUNO_REF" ] && [ -d .git ]; then
@@ -155,17 +197,58 @@ ensure_repo() {
     fi
     return 0
   fi
+
+    # Case 2: repo exists — fetch, otherwise clone
   if [ -d "$WORKDIR/.git" ]; then
-    log "Updating existing repo"
-    run git -C "$WORKDIR" fetch --all --prune
+    log "Updating existing repo at $WORKDIR"
+    run git -C "$WORKDIR" fetch --all --tags --prune
   else
-    log "Cloning Bruno → $WORKDIR"
-    run git clone --depth=1 "$BRUNO_GIT" "$WORKDIR"
+    if [ -n "$BRUNO_REF" ]; then
+      log "Cloning Bruno @ ${BRUNO_REF} → $WORKDIR"
+      if [ "${DRY_RUN}" = "1" ]; then
+        # Simulate a repo with package.json so later steps work
+        log "[DRY] Simulating clone of $BRUNO_REF at $WORKDIR"
+        mkdir -p "$WORKDIR"
+        printf '{ "name": "bruno", "version": "0.0.0" }\n' > "$WORKDIR/package.json"
+      else
+        # Try shallow clone of the exact ref
+        run git clone --depth=1 --branch "$BRUNO_REF" --single-branch "$BRUNO_GIT" "$WORKDIR" || {
+          warn "Shallow clone of '$BRUNO_REF' failed; falling back to full clone"
+          run git clone "$BRUNO_GIT" "$WORKDIR"
+          run git -C "$WORKDIR" fetch --tags --force --prune
+          run git -C "$WORKDIR" -c advice.detachedHead=false checkout --quiet "$BRUNO_REF"
+        }
+      fi
+    else
+      log "Cloning Bruno (default branch) → $WORKDIR"
+      if [ "${DRY_RUN}" = "1" ]; then
+        log "[DRY] Simulating clone at $WORKDIR"
+        mkdir -p "$WORKDIR"
+        printf '{ "name": "bruno", "version": "0.0.0" }\n' > "$WORKDIR/package.json"
+      else
+        run git clone --depth=1 "$BRUNO_GIT" "$WORKDIR"
+      fi
+    fi
   fi
-  cd "$WORKDIR"
+
+  cd "$WORKDIR" || die "Cannot enter $WORKDIR"
   if [ -n "$BRUNO_REF" ]; then
     log "Checking out ref: $BRUNO_REF"
-    run git checkout --quiet "$BRUNO_REF"
+    if [ "${DRY_RUN}" = "1" ]; then
+      log "[DRY] Would checkout $BRUNO_REF"
+    else
+      run git checkout --quiet "$BRUNO_REF"
+    fi
+  fi
+
+  # Sanity
+  if [ ! -f package.json ]; then
+    if [ "${DRY_RUN}" = "1" ]; then
+      printf '{ "name": "bruno", "version": "0.0.0" }\n' > package.json
+      warn "Dry-run: created stub package.json"
+    else
+      die "Bruno repo bootstrap failed: $WORKDIR does not contain package.json"
+    fi
   fi
 }
 
@@ -173,8 +256,81 @@ ensure_repo() {
 jfrog_headers() {
   # Prints curl -H args if ART_TOKEN set (both API key and Bearer forms)
   if [ -n "${ART_TOKEN:-}" ]; then
-    printf -- "-H 'X-JFrog-Art-Api: %s' -H 'Authorization: Bearer %s'" "$ART_TOKEN" "$ART_TOKEN"
+    printf -- "-H X-JFrog-Art-Api:%s -H Authorization:Bearer:%s" "$ART_TOKEN" "$ART_TOKEN" | sed 's/ /" "/g' | xargs -n1 echo | sed 's/^/-H "/;s/$/"/'
   fi
+}
+
+jfrog_base_url_from_any() {
+  # Derive https://host/artifactory from either full api/npm URL or ART_URL
+  if [ -n "${ART_URL:-}" ]; then
+    printf '%s/artifactory' "$(trim_trailing_slash "$ART_URL")"
+    return 0
+  fi
+  local src="${ART_PUBLISH_REG:-${ART_INSTALL_REG:-}}"
+  [ -n "$src" ] || { echo ""; return 0; }
+  src="$(trim_trailing_slash "$src")"
+  # strip /api/npm/<repo> if present
+  src="${src%%/api/npm/*}"
+  # ensure trailing /artifactory
+  if [[ "$src" != *"/artifactory" ]]; then
+    src="${src%/}/artifactory"
+  fi
+  printf '%s' "$src"
+}
+
+upload_to_artifactory() {
+  # usage: upload_to_artifactory <repoName> <localFile> <destPathRelativeToRepo>
+  local repo="$1" file="$2" dest_rel="$3"
+  local base; base="$(jfrog_base_url_from_any)"
+  [ -n "$base" ] || { warn "Cannot derive Artifactory base URL; skip upload for $file"; return 1; }
+  [ -f "$file" ] || { warn "File not found for upload: $file"; return 1; }
+
+  local url="${base%/}/$repo/$dest_rel"
+  local curl_args=()
+  if [ -n "${ART_TOKEN:-}" ]; then
+    curl_args+=(-H "X-JFrog-Art-Api: ${ART_TOKEN}")
+    curl_args+=(-H "Authorization: Bearer ${ART_TOKEN}")
+  fi
+
+  log "Uploading $(basename "$file") → $url"
+  if [ "${DRY_RUN}" = "1" ]; then
+    printf '[DRY] curl -T %q %q (with auth headers if set)\n' "$file" "$url"
+    return 0
+  fi
+
+  # Use PUT with -T to create/overwrite
+  if ! curl -fsS -X PUT "${curl_args[@]}" -T "$file" "$url"; then
+    warn "Upload failed: $file → $url"
+    return 1
+  fi
+  log "Upload OK: $file"
+}
+
+create_sources_archive() {
+  # usage: create_sources_archive <srcDir> <outFile>
+  local src="$1" out="$2"
+  log "Creating sources archive (no node_modules/dist/.git): $out"
+  if [ "${DRY_RUN}" = "1" ]; then
+    printf '[DRY] tar czf %q --exclude patterns from %q\n' "$out" "$src"
+    return 0
+  fi
+  (
+    cd "$src"
+    tar -czf "$out" \
+      --exclude='./node_modules' \
+      --exclude='**/node_modules' \
+      --exclude='./dist' \
+      --exclude='**/dist' \
+      --exclude='./build' \
+      --exclude='**/build' \
+      --exclude='./.git' \
+      --exclude='**/.git' \
+      --exclude='./.turbo' \
+      --exclude='**/.turbo' \
+      --exclude='./.cache' \
+      --exclude='**/.cache' \
+      .
+  )
 }
 
 wait_for_package_visibility() {
@@ -194,7 +350,6 @@ wait_for_package_visibility() {
     if NPM_CONFIG_USERCONFIG="$NPMRC_INSTALL" npm_view "${name}@${ver}" version --registry "$reg" >/dev/null; then
       log "Found via npm view: $name@$ver"; return 0
     fi
-    # Curl JSON fallback (Artifactory/npm endpoint returns package metadata JSON)
     if eval "curl -fsS $hdrs '$reg/$enc_name' 2>/dev/null | grep -q '\"$ver\"'"; then
       log "Found via registry JSON: $name@$ver"; return 0
     fi
@@ -222,25 +377,40 @@ version_exists_in_registry() {
 }
 
 npm_mirror_publish() {
-  local spec="$1" resolved_name resolved_ver
-  resolved_name="$(npm_view "$spec" name --registry "$PUBLIC_REG" || true)"
-  resolved_ver="$(npm_view "$spec" version --registry "$PUBLIC_REG" || true)"
+  local spec="$1"
+  local resolved_name resolved_ver source_reg tried_public=0
+
+  # 1) Try public npm first (use install npmrc so proxy/ssl env applies)
+  resolved_name="$(NPM_CONFIG_USERCONFIG="$NPMRC_INSTALL" npm "${WORKSPACES_OFF[@]}" view "$spec" name --registry "$PUBLIC_REG" 2>/dev/null || true)"
+  resolved_ver="$(NPM_CONFIG_USERCONFIG="$NPMRC_INSTALL" npm "${WORKSPACES_OFF[@]}" view "$spec" version --registry "$PUBLIC_REG" 2>/dev/null || true)"
+  if [ -n "$resolved_name" ] && [ -n "$resolved_ver" ]; then
+    source_reg="$PUBLIC_REG"; tried_public=1
+  else
+    # 2) Fall back to your authenticated install registry (Artifactory virtual)
+    resolved_name="$(NPM_CONFIG_USERCONFIG="$NPMRC_INSTALL" npm "${WORKSPACES_OFF[@]}" view "$spec" name --registry "$install_registry" 2>/dev/null || true)"
+    resolved_ver="$(NPM_CONFIG_USERCONFIG="$NPMRC_INSTALL" npm "${WORKSPACES_OFF[@]}" view "$spec" version --registry "$install_registry" 2>/dev/null || true)"
+    [ -n "$resolved_name" ] && [ -n "$resolved_ver" ] && source_reg="$install_registry"
+  fi
+
   if [ -z "$resolved_name" ] || [ -z "$resolved_ver" ]; then
-    warn "Unable to resolve name/version for '$spec' from public registry; skipping mirror."
+    warn "Unable to resolve $spec from either public npm or install registry; skipping mirror."
     return 0
   fi
+
   if version_exists_in_registry "$resolved_name" "$resolved_ver" "$publish_registry"; then
     log "Mirror skip — already present: ${resolved_name}@${resolved_ver} in $publish_registry"
     return 0
   fi
-  log "Mirroring ${resolved_name}@${resolved_ver} → $publish_registry"
+
+  log "Mirroring ${resolved_name}@${resolved_ver} from $source_reg → $publish_registry (public_hit=$tried_public)"
   if [ "${DRY_RUN}" = "1" ]; then
-    printf '[DRY] npm pack %s@%s; npm publish tgz\n' "$resolved_name" "$resolved_ver"
+    printf '[DRY] npm pack %s@%s --registry %s; npm publish tgz --registry %s\n' "$resolved_name" "$resolved_ver" "$source_reg" "$publish_registry"
   else
-    local tgz; tgz="$(npm pack "${resolved_name}@${resolved_ver}" --registry "$PUBLIC_REG" 2>/dev/null | tail -n1)" || true
-    [ -n "${tgz:-}" ] && [ -f "$tgz" ] || die "npm pack failed for ${resolved_name}@${resolved_ver}"
-    # publish with PUBLISH npmrc (LOCAL)
-    npm_unset_ws "${NPMRC_PUBLISH}" npm publish "$tgz" --registry "$publish_registry" --access public || warn "Publish of ${resolved_name}@${resolved_ver} returned non-zero; continuing."
+    local tgz
+    tgz="$(NPM_CONFIG_USERCONFIG="$NPMRC_INSTALL" npm pack "${resolved_name}@${resolved_ver}" --registry "$source_reg" 2>/dev/null | tail -n1)" || true
+    [ -n "${tgz:-}" ] && [ -f "$tgz" ] || die "npm pack failed for ${resolved_name}@${resolved_ver} from $source_reg"
+    npm_unset_ws "${NPMRC_PUBLISH}" npm publish "$tgz" --registry "$publish_registry" --access public || \
+      warn "Publish of ${resolved_name}@${resolved_ver} returned non-zero; continuing."
     rm -f "$tgz"
   fi
 }
@@ -337,6 +507,7 @@ registry_proxies_public_npm() {
 # ---------- Main flow --------------------------------------------------------
 main() {
   req git; req node; req npm
+  req tar; req curl
 
   local install_registry publish_registry token_for_install token_for_publish
 
@@ -549,7 +720,23 @@ EOF
     warn "Skipped temp install test (DO_TEMP_INSTALL_TEST=false)"
   fi
 
+  # ---- NEW: create sources archive and upload --------------------------------
+  local ARCHIVE_NAME="bruno-sources-${VERSION_SUFFIX}.tar.gz"
+  local ARCHIVE_PATH="${PWD}/${ARCHIVE_NAME}"
+  create_sources_archive "$WORKDIR" "$ARCHIVE_PATH" || warn "Failed to create sources archive"
+
+  # Upload sources archive to ART_ARCHIVE_REPO (defaults to cagbu-dev-opensource-release-node)
+  # Destination path includes a friendly folder and filename with VERSION_SUFFIX
+  upload_to_artifactory "$ART_ARCHIVE_REPO" "$ARCHIVE_PATH" "bruno/sources/${ARCHIVE_NAME}" || true
+
+  # Upload log file to ART_LOGS_REPO
+  upload_to_artifactory "$ART_LOGS_REPO" "$LOG_FILE" "bruno/logs/bruno-build-publish.${VERSION_SUFFIX}.log" || true
+  # ----------------------------------------------------------------------------
+
   log "Done. Installed/published against: $install_registry (publish → $publish_registry)"
+  log "Artifacts:"
+  log " - Sources archive: $ARCHIVE_PATH"
+  log " - Build log:       $LOG_FILE"
   log "Tip: git-ignore .npmrc.install / .npmrc.publish if you commit this repo."
 }
 

@@ -4,3 +4,4 @@
 node_modules
 /bruno-src/
 .DS_Store
+*.log
