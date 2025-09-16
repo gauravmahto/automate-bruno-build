@@ -11,6 +11,17 @@
 #       - sources  → cagbu-dev-opensource-release-node
 #       - logs     → cagbu-dev-opensource-release-logs
 # ----------------------------------------------------------------------------
+# Docs: See README-bruno-build-publish.md (how/why, config, full flow)
+# Quick start (zsh):
+#   # Verdaccio
+#   REG_MODE=verdaccio VERDACCIO_URL=http://127.0.0.1:8080 ./bruno-build-publish.sh
+#   # JFrog (virtual for install, local for publish)
+#   REG_MODE=jfrog ART_INSTALL_REG=https://<host>/artifactory/api/npm/<virtual>/ \
+#     ART_PUBLISH_REG=https://<host>/artifactory/api/npm/<local>/ ART_TOKEN=XXXXX \
+#     ./bruno-build-publish.sh
+#   # Dry run (no mutations)
+#   DRY_RUN=1 ./bruno-build-publish.sh
+
 set -euo pipefail
 
 # ---------- Config (env overrides) ------------------------------------------
@@ -63,7 +74,13 @@ warn() { printf "\033[1;33m[WARN]\033[0m %s\n" "$*"; }
 die()  { printf "\033[1;31m[ERR ]\033[0m %s\n" "$*" >&2; exit 1; }
 req()  { command -v "$1" >/dev/null || die "Missing required command: $1"; }
 
-run() { if [ "${DRY_RUN}" = "1" ]; then printf '[DRY] %s\n' "$*"; else eval "$@"; fi; }
+run() {
+  if [ "${DRY_RUN}" = "1" ]; then
+    printf '[DRY] %s\n' "$*"
+  else
+    "$@"
+  fi
+}
 trim_trailing_slash() { local s="$1"; s="${s%/}"; printf '%s' "$s"; }
 
 json_get_name()    { node -p 'require("./package.json").name'    2>/dev/null; }
@@ -89,7 +106,8 @@ npm_ping() {
     return 0
   fi
   log "npm ping failed; trying HTTP GET to /-/ping"
-  local url="$(trim_trailing_slash "$registry")/-/ping"
+  local url
+  url="$(trim_trailing_slash "$registry")/-/ping"
   local curl_args=(-fsS -X GET)
   # Add both Artifactory auth header variants if token provided
   if [ -n "$token" ]; then
@@ -146,8 +164,10 @@ npm_pack_publish_dir() {
 write_dual_npmrcs() {
   local install_registry="$1" install_token="$2" publish_registry="$3" publish_token="$4"
 
-  local inst="$(trim_trailing_slash "$install_registry")/"
-  local pub="$(trim_trailing_slash "$publish_registry")/"
+  local inst
+  inst="$(trim_trailing_slash "$install_registry")/"
+  local pub
+  pub="$(trim_trailing_slash "$publish_registry")/"
 
   NPMRC_INSTALL="$PWD/.npmrc.install"
   NPMRC_PUBLISH="$PWD/.npmrc.publish"
